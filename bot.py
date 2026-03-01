@@ -183,6 +183,18 @@ def db_get_daily(wallet_id):
                 return d
             return {"wallet_id": wallet_id, "date": today, "total": 0, "volume": 0.0, "markets": []}
 
+def db_get_daily_by_date(wallet_id, target_date):
+    with DB_LOCK:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT * FROM daily WHERE wallet_id=? AND date=?", (wallet_id, target_date)
+            ).fetchone()
+            if row:
+                d = dict(row)
+                d["markets"] = json.loads(d["markets"])
+                return d
+            return {"wallet_id": wallet_id, "date": target_date, "total": 0, "volume": 0.0, "markets": []}
+
 def db_add_trade_to_daily(wallet_id, trade):
     daily = db_get_daily(wallet_id)
     daily["total"] += 1
@@ -243,10 +255,12 @@ def back_btn():
     return {"inline_keyboard": [[{"text": "Main Menu", "callback_data": "main_menu"}]]}
 
 def wallet_display(w):
-    """Return nickname or short address."""
     if w.get("nickname"):
         return w["nickname"]
     eoa = w.get("eoa", "")
+    return eoa[:6] + "..." + eoa[-4:] if len(eoa) >= 10 else eoa
+
+def short_addr(eoa):
     return eoa[:6] + "..." + eoa[-4:] if len(eoa) >= 10 else eoa
 
 def main_menu_text(user_name, chat_id):
@@ -256,9 +270,7 @@ def main_menu_text(user_name, chat_id):
     if count > 0:
         def fmt_wallet(w):
             if w.get("nickname"):
-                eoa = w["eoa"]
-                short = eoa[:6] + "..." + eoa[-4:]
-                return f"{w['nickname']} (`{short}`)"
+                return f"{w['nickname']} (`{short_addr(w['eoa'])}`)"
             return f"`{w['eoa']}`"
         wallet_lines = "\n".join(f"• {fmt_wallet(w)}" for w in wallets)
         return (
@@ -300,11 +312,10 @@ def my_wallets_text(chat_id):
         return f"📋 *My Wallets (0/{MAX_WALLETS})*\n\nNo wallets added yet."
     lines = [f"📋 *My Wallets ({count}/{MAX_WALLETS})*\n"]
     for w in wallets:
-        name  = wallet_display(w)
-        eoa   = w["eoa"]
-        short = eoa[:6] + "..." + eoa[-4:]
+        name = wallet_display(w)
+        eoa  = w["eoa"]
         if w.get("nickname"):
-            lines.append(f"• {name} (`{short}`)")
+            lines.append(f"• {name} (`{short_addr(eoa)}`)")
         else:
             lines.append(f"• `{eoa}`")
     return "\n".join(lines)
@@ -359,6 +370,42 @@ def fetch_trades(api_key, wallet):
             last_err = e
             time.sleep(2)
     raise last_err
+
+def fetch_all_positions(api_key, eoa):
+    """Fetch all pages of positions, return list of active positions with shares >= 1."""
+    all_positions = []
+    page = 1
+    while True:
+        url = f"{OPINION_POSITIONS_URL.format(wallet=eoa)}?limit=20&page={page}"
+        try:
+            resp = requests.get(url, headers={"apikey": api_key}, timeout=30)
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            items = result.get("list") or []
+            if not items:
+                break
+            all_positions.extend(items)
+            # If less than 20 returned, we've reached the last page
+            if len(items) < 20:
+                break
+            page += 1
+        except Exception:
+            break
+    # Filter active with shares
+    active = [p for p in all_positions
+              if p.get("marketStatusEnum") == "Activated"
+              and float(p.get("sharesOwned") or 0) >= 1]
+    return active
+
+def fetch_positions_summary(api_key, eoa):
+    """Return (total_positions, total_value) for daily summary."""
+    try:
+        positions = fetch_all_positions(api_key, eoa)
+        total = len(positions)
+        value = sum(float(p.get("currentValueInQuoteToken") or 0) for p in positions)
+        return total, value
+    except Exception:
+        return None, None
 
 def fetch_positions_text(api_key, eoa, wallet_name):
     url = OPINION_POSITIONS_URL.format(wallet=eoa)
@@ -468,7 +515,6 @@ def format_trade_alert(wallet_row, t):
     try:    usd   = f"${float(t.get('amount') or 0):,.2f}"
     except: usd   = "?"
 
-    # Show nickname + address if nickname exists, else just address
     if wallet_row.get("nickname"):
         wallet_line = f"{name} (`{eoa}`)"
     else:
@@ -484,34 +530,69 @@ def format_trade_alert(wallet_row, t):
         f"• Order Price: {price}",
     ])
 
-def build_daily_summary(chat_id):
+
+# ============================================================
+# DAILY SUMMARY
+# ============================================================
+
+def build_daily_summary(chat_id, target_date=None):
     wallets = db_get_wallets(chat_id)
     if not wallets:
         return None
-    today = str(date.today())
+
+    user = db_get_user(chat_id)
+    api_key = user["api_key"] if user else None
+
+    if target_date is None:
+        target_date = str(date.today())
+
     try:
-        d_fmt = datetime.strptime(today, "%Y-%m-%d").strftime("%b %d, %Y")
+        d_fmt = datetime.strptime(target_date, "%Y-%m-%d").strftime("%b %d, %Y")
     except Exception:
-        d_fmt = today
+        d_fmt = target_date
 
     lines = [f"📊 *Daily Report — {d_fmt}*\n"]
+
+    # Fetch positions in parallel
+    pos_results = {}
+    def fetch_pos(w):
+        if api_key:
+            total, value = fetch_positions_summary(api_key, w["eoa"])
+            pos_results[w["id"]] = (total, value)
+        else:
+            pos_results[w["id"]] = (None, None)
+
+    threads = [threading.Thread(target=fetch_pos, args=(w,)) for w in wallets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
     for w in wallets:
-        daily   = db_get_daily(w["id"])
-        name    = wallet_display(w)
-        total   = daily.get("total", 0)
-        volume  = daily.get("volume", 0.0)
+        daily  = db_get_daily_by_date(w["id"], target_date)
+        name   = wallet_display(w)
+        eoa    = w["eoa"]
+        total  = daily.get("total", 0)
+        volume = daily.get("volume", 0.0)
         markets = daily.get("markets", [])
+        pos_total, pos_value = pos_results.get(w["id"], (None, None))
 
         lines.append(f"*{name}*")
-        lines.append(f"`{w['eoa']}`")
+        lines.append(f"`{short_addr(eoa)}`")
+
         if total == 0:
             lines.append("No trades today.")
         else:
             lines.append(f"Trades: {total} | Volume: ${volume:,.2f}")
-            lines.append("Markets traded:")
-            for m in markets:
-                lines.append(f"• {m}")
+            lines.append(f"Markets: {len(markets)} traded")
+
+        if pos_total is not None:
+            lines.append(f"Positions: {pos_total} | Portfolio Value: ${pos_value:,.2f}")
+        else:
+            lines.append("Positions: N/A")
+
         lines.append("")
+
     return "\n".join(lines)
 
 
@@ -559,7 +640,6 @@ class MonitorThread(threading.Thread):
                                 break
                             new_trades.append(tr)
 
-                        # Refresh wallet_row for latest nickname
                         self.wallet_row = db_get_wallet(self.wallet_id) or self.wallet_row
 
                         for tr in reversed(new_trades):
@@ -585,7 +665,7 @@ class MonitorThread(threading.Thread):
 
 
 # ============================================================
-# MONITOR REGISTRY  key=(chat_id, wallet_id)
+# MONITOR REGISTRY
 # ============================================================
 
 MONITORS      = {}
@@ -623,7 +703,7 @@ def stop_all_monitors(chat_id):
 # CONVERSATION STATE
 # ============================================================
 
-CHAT_STATE = {}  # chat_id -> {"step": ..., "data": {...}}
+CHAT_STATE = {}
 
 def get_step(chat_id):    return CHAT_STATE.get(chat_id, {}).get("step")
 def get_state(chat_id):   return CHAT_STATE.get(chat_id, {})
@@ -677,7 +757,6 @@ def handle_message(message):
     step  = get_step(chat_id)
     state = get_state(chat_id)
 
-    # --- API key ---
     if step == "waiting_api_key":
         api_key = text.strip()
         send_message(chat_id, "🔄 Validating API key...")
@@ -698,7 +777,6 @@ def handle_message(message):
         send_message(chat_id, "🔄 Validating API key...")
         if validate_api_key(api_key):
             db_upsert_user(chat_id, api_key=api_key)
-            # Restart all monitors with new key
             wallets = db_get_wallets(chat_id)
             stop_all_monitors(chat_id)
             for w in wallets:
@@ -709,7 +787,6 @@ def handle_message(message):
             send_message(chat_id, "❌ Invalid API key. Please try again.\n\n🔑 Enter your new API key:")
         return
 
-    # --- EOA wallet ---
     if step == "waiting_eoa":
         eoa = text.strip()
         if not (eoa.startswith("0x") and len(eoa) == 42):
@@ -717,7 +794,6 @@ def handle_message(message):
                 "❌ Invalid wallet address. Must start with `0x` and be 42 characters long.\n\n"
                 "Please enter a valid EOA address:")
             return
-        # Check duplicate
         existing = db_get_wallets(chat_id)
         if any(w["eoa"].lower() == eoa.lower() for w in existing):
             send_message(chat_id,
@@ -732,9 +808,8 @@ def handle_message(message):
         )
         return
 
-    # --- Nickname ---
     if step == "waiting_nickname":
-        nickname   = text.strip() or None
+        nickname    = text.strip() or None
         pending_eoa = state.get("pending_eoa")
         _finish_add_wallet(chat_id, pending_eoa, nickname, user_name)
         return
@@ -824,7 +899,6 @@ def handle_callback(callback_query):
         pending_eoa = state.get("pending_eoa")
         if pending_eoa:
             _finish_add_wallet(chat_id, pending_eoa, None, user_name)
-            # Edit the previous message to avoid orphan buttons
             try:
                 edit_message(chat_id, message_id, f"Wallet: `{pending_eoa}`\n\nNickname: _(none)_")
             except Exception:
@@ -935,6 +1009,7 @@ def daily_summary_loop():
             now       = datetime.utcnow()
             today_str = str(date.today())
             if now.hour == 23 and now.minute >= 58 and last_sent_date != today_str:
+                print(f"[Daily] Sending summaries for {today_str}")
                 chat_ids = db_get_all_users_with_wallets()
                 for chat_id in chat_ids:
                     try:
@@ -944,7 +1019,7 @@ def daily_summary_loop():
                     except Exception as e:
                         print(f"[Daily] Error for chat {chat_id}: {repr(e)}")
                 last_sent_date = today_str
-                print(f"[Daily] Summaries sent for {today_str}")
+                print(f"[Daily] Done for {today_str}")
         except Exception as e:
             print(f"[Daily] Loop error: {repr(e)}")
         time.sleep(30)
@@ -958,16 +1033,13 @@ def run_bot():
     init_db()
     print("Opitrack v2 bot started.")
 
-    # Resume monitors for all active wallets
     wallets = db_get_all_active_wallets()
     for w in wallets:
         print(f"[Resume] chat={w['chat_id']} wallet={w['eoa']}")
         start_monitor(w["chat_id"], w["api_key"], w)
 
-    # Daily summary background thread
     threading.Thread(target=daily_summary_loop, daemon=True).start()
 
-    # Telegram long-polling
     offset        = 0
     processed_ids = set()
 
