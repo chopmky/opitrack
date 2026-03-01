@@ -505,10 +505,18 @@ def format_trade_alert(wallet_row, t):
     else:
         link = root
 
-    if is_multi and sub and sub != root:
-        action = f"*{side} {outcome} ({sub})*"
+    # Get yes/no labels for this market
+    mkt_id_for_label = int(root_id) if root_id and str(root_id).isdigit() else None
+    if mkt_id_for_label:
+        yes_label, no_label = get_market_labels(mkt_id_for_label)
     else:
-        action = f"*{side} {outcome}*"
+        yes_label, no_label = "YES", "NO"
+    outcome_label = yes_label if str(t.get("outcomeSide")) == "1" else no_label
+
+    if is_multi and sub and sub != root:
+        action = f"*{side} {outcome_label} ({sub})*"
+    else:
+        action = f"*{side} {outcome_label}*"
 
     try:    price = f"{float(t.get('price') or 0)*100:.1f} c"
     except: price = "?"
@@ -698,6 +706,36 @@ def stop_all_monitors(chat_id):
             if t and t.is_alive():
                 t.stop()
 
+
+
+# ============================================================
+# MARKET LABEL CACHE
+# ============================================================
+MARKET_CACHE = {}
+MARKET_CACHE_LOCK = threading.Lock()
+
+def get_market_labels(market_id):
+    """Return (yes_label, no_label) for a market, cached."""
+    with MARKET_CACHE_LOCK:
+        if market_id in MARKET_CACHE:
+            return MARKET_CACHE[market_id]
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT api_key FROM users WHERE api_key IS NOT NULL LIMIT 1").fetchone()
+            api_key = row["api_key"] if row else None
+        if not api_key:
+            return "YES", "NO"
+        url = f"https://openapi.opinion.trade/openapi/market/{market_id}"
+        resp = requests.get(url, headers={"apikey": api_key}, timeout=10)
+        data = resp.json().get("result", {}).get("data", {})
+        yes_label = data.get("yesLabel") or "YES"
+        no_label  = data.get("noLabel")  or "NO"
+        with MARKET_CACHE_LOCK:
+            MARKET_CACHE[market_id] = (yes_label, no_label)
+        return yes_label, no_label
+    except Exception:
+        pass
+    return "YES", "NO"
 
 # ============================================================
 # CONVERSATION STATE
