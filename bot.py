@@ -527,7 +527,7 @@ class MonitorThread(threading.Thread):
         self.wallet_row   = wallet_row
         self.wallet_id    = wallet_row["id"]
         self.eoa          = wallet_row["eoa"]
-        self.last_seen_id = wallet_row.get("last_seen_id")
+        self.last_seen_id = wallet_row.get("last_seen_id") or None
         self.stop_event   = threading.Event()
         self.last_heartbeat = 0
 
