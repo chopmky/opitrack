@@ -476,6 +476,58 @@ def fetch_history_text(api_key, eoa, wallet_name):
         return "Could not fetch trade history. Please try again later."
 
 
+def fetch_orderbook_lines(market_id, outcome_side, yes_label, no_label, side, api_key, sub_title=None):
+    """Fetch orderbook and return formatted lines for trade alert."""
+    try:
+        # Get market to find token IDs
+        url = f"https://openapi.opinion.trade/openapi/market/{market_id}"
+        resp = requests.get(url, headers={"apikey": api_key}, timeout=10)
+        data = resp.json().get("result", {}).get("data", {})
+        if not data:
+            return None
+
+        # Pick token based on outcome
+        # For multi-markets, yes/no label is generic - use sub-market title if available
+        raw_yes = data.get("yesLabel") or "YES"
+        raw_no  = data.get("noLabel")  or "NO"
+        is_generic = raw_yes.upper() == "YES" and raw_no.upper() == "NO"
+
+        if str(outcome_side) == "1":
+            token_id = data.get("yesTokenId")
+            outcome_name = sub_title if is_generic and sub_title else yes_label
+        else:
+            token_id = data.get("noTokenId")
+            outcome_name = sub_title if is_generic and sub_title else no_label
+
+        if not token_id:
+            return None
+
+        # Fetch orderbook
+        ob_url = f"https://proxy.opinion.trade:8443/openapi/token/orderbook?token_id={token_id}"
+        ob_resp = requests.get(ob_url, headers={"apikey": api_key}, timeout=10)
+        ob = ob_resp.json().get("result", {})
+
+        # BUY → show asks, SELL → show bids
+        is_buy = str(side).lower() == "buy"
+        raw = ob.get("asks" if is_buy else "bids", [])
+        orders = sorted(raw, key=lambda x: float(x["price"]), reverse=not is_buy)
+        if not orders:
+            return None
+
+        label = "Asks" if is_buy else "Bids"
+        lines = [f"Best {outcome_name} {label}:"]
+        for o in orders[:3]:
+            try:
+                price_c = float(o["price"]) * 100
+                size_usd = float(o["size"]) * float(o["price"])
+                lines.append(f"• {price_c:.1f}c - ${size_usd:,.2f}")
+            except Exception:
+                pass
+        return "\n".join(lines) if len(lines) > 1 else None
+    except Exception:
+        return None
+
+
 # ============================================================
 # TRADE FORMAT
 # ============================================================
@@ -528,7 +580,21 @@ def format_trade_alert(wallet_row, t):
     else:
         wallet_line = f"`{eoa}`"
 
-    return "\n".join([
+    # Fetch orderbook - use marketId (sub-market) not rootMarketId
+    ob_lines = None
+    try:
+        mkt_id_int = int(mkt_id) if mkt_id and str(mkt_id).isdigit() else None
+        user_api_key = None
+        with get_db() as conn:
+            row = conn.execute("SELECT api_key FROM users WHERE chat_id=? LIMIT 1", (wallet_row["chat_id"],)).fetchone()
+            if row:
+                user_api_key = row["api_key"]
+        if mkt_id_int and user_api_key:
+            ob_lines = fetch_orderbook_lines(mkt_id_int, t.get("outcomeSide"), yes_label, no_label, t.get("side"), user_api_key, sub_title=sub)
+    except Exception:
+        pass
+
+    parts = [
         "✅ *TRADE EXECUTED*",
         "",
         f"Market: {link}",
@@ -536,7 +602,12 @@ def format_trade_alert(wallet_row, t):
         f"Target Wallet: {wallet_line}",
         f"• Action: {action} for {usd}",
         f"• Order Price: {price}",
-    ])
+    ]
+    if ob_lines:
+        parts.append("")
+        parts.append(ob_lines)
+
+    return "\n".join(parts)
 
 
 # ============================================================
