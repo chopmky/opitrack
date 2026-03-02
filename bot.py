@@ -503,7 +503,7 @@ def fetch_orderbook_lines(market_id, outcome_side, yes_label, no_label, side, ap
             return None
 
         # Fetch orderbook
-        ob_url = f"https://proxy.opinion.trade:8443/openapi/token/orderbook?token_id={token_id}"
+        ob_url = f"https://openapi.opinion.trade/openapi/token/orderbook?token_id={token_id}"
         ob_resp = requests.get(ob_url, headers={"apikey": api_key}, timeout=10)
         ob = ob_resp.json().get("result", {})
 
